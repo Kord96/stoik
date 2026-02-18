@@ -1,0 +1,15 @@
+duckdb
+pyarrow
+structlog
+
+[all]
+confluent-kafka
+flightsql-dbapi
+protobuf
+
+[flight]
+flightsql-dbapi
+protobuf
+
+[kafka]
+confluent-kafka
