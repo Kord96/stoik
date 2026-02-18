@@ -27,7 +27,108 @@ logger = structlog.get_logger()
 _STASH_TTL = 60
 
 
-class FlightSQLServer(flight.FlightServerBase):
+class _FlightSQLBase(flight.FlightServerBase):
+    """Base class providing stash management and Flight SQL request routing.
+
+    Subclasses must implement:
+        _handle_statement_query(any_msg) -> FlightInfo
+        _handle_get_tables(any_msg) -> FlightInfo
+        _handle_get_db_schemas() -> FlightInfo
+        _handle_get_catalogs() -> FlightInfo
+    """
+
+    def __init__(self, location: str, **kwargs):
+        super().__init__(location, **kwargs)
+        self._stash: dict[bytes, tuple[pa.Schema, pa.Table, float]] = {}
+        self._stash_lock = threading.Lock()
+
+    # ── Flight SQL: get_flight_info ───────────────────────────────
+
+    def get_flight_info(self, context, descriptor):
+        any_msg = any_pb2.Any()
+        any_msg.ParseFromString(descriptor.command)
+
+        if any_msg.Is(pb2.CommandStatementQuery.DESCRIPTOR):
+            return self._handle_statement_query(any_msg)
+
+        if any_msg.Is(pb2.CommandGetTables.DESCRIPTOR):
+            return self._handle_get_tables(any_msg)
+
+        if any_msg.Is(pb2.CommandGetDbSchemas.DESCRIPTOR):
+            return self._handle_get_db_schemas()
+
+        if any_msg.Is(pb2.CommandGetCatalogs.DESCRIPTOR):
+            return self._handle_get_catalogs()
+
+        raise flight.FlightUnauthenticatedError(
+            f"Unsupported command: {any_msg.type_url}"
+        )
+
+    # ── Flight SQL: do_get ────────────────────────────────────────
+
+    def do_get(self, context, ticket):
+        ticket_msg = pb2.TicketStatementQuery()
+        ticket_msg.ParseFromString(ticket.ticket)
+        handle = ticket_msg.statement_handle
+
+        with self._stash_lock:
+            entry = self._stash.pop(handle, None)
+
+        if entry is None:
+            raise flight.FlightServerError("Unknown or expired statement handle")
+
+        _schema, data, _ts = entry
+        # Works for both pa.Table and pa.RecordBatchReader
+        return flight.RecordBatchStream(data)
+
+    # ── Stash helpers ─────────────────────────────────────────────
+
+    def _stash_and_info(self, table: pa.Table) -> flight.FlightInfo:
+        handle = uuid.uuid4().bytes
+        with self._stash_lock:
+            self._stash[handle] = (table.schema, table, time.monotonic())
+            self._evict_expired()
+        ticket_msg = pb2.TicketStatementQuery(statement_handle=handle)
+        ticket = flight.Ticket(ticket_msg.SerializeToString())
+        endpoint = flight.FlightEndpoint(ticket, [])
+        return flight.FlightInfo(
+            table.schema,
+            descriptor=flight.FlightDescriptor.for_command(b""),
+            endpoints=[endpoint],
+            total_records=table.num_rows,
+            total_bytes=table.nbytes,
+        )
+
+    def _stash_reader_and_info(self, reader: pa.RecordBatchReader) -> flight.FlightInfo:
+        """Stash a streaming RecordBatchReader for later do_get."""
+        handle = uuid.uuid4().bytes
+        schema = reader.schema
+        with self._stash_lock:
+            self._stash[handle] = (schema, reader, time.monotonic())
+            self._evict_expired()
+        ticket_msg = pb2.TicketStatementQuery(statement_handle=handle)
+        ticket = flight.Ticket(ticket_msg.SerializeToString())
+        endpoint = flight.FlightEndpoint(ticket, [])
+        return flight.FlightInfo(
+            schema,
+            descriptor=flight.FlightDescriptor.for_command(b""),
+            endpoints=[endpoint],
+            total_records=-1,
+            total_bytes=-1,
+        )
+
+    # ── Stash maintenance ─────────────────────────────────────────
+
+    def _evict_expired(self):
+        """Remove stash entries older than TTL. Must hold self._stash_lock."""
+        now = time.monotonic()
+        expired = [k for k, (_, _, ts) in self._stash.items()
+                   if now - ts > _STASH_TTL]
+        for k in expired:
+            del self._stash[k]
+
+
+class FlightSQLServer(_FlightSQLBase):
     """Flight SQL server that queries a cached DuckDB connection.
 
     Args:
@@ -55,8 +156,6 @@ class FlightSQLServer(flight.FlightServerBase):
         self._conn = None
         self._conn_lock = threading.Lock()
         self._snapshot_mtimes: dict[str, float] = {}
-        self._stash: dict[bytes, tuple[pa.Schema, pa.Table, float]] = {}
-        self._stash_lock = threading.Lock()
 
     # ── Connection caching ────────────────────────────────────────
 
@@ -95,27 +194,7 @@ class FlightSQLServer(flight.FlightServerBase):
             except OSError:
                 pass
 
-    # ── Flight SQL: get_flight_info ───────────────────────────────
-
-    def get_flight_info(self, context, descriptor):
-        any_msg = any_pb2.Any()
-        any_msg.ParseFromString(descriptor.command)
-
-        if any_msg.Is(pb2.CommandStatementQuery.DESCRIPTOR):
-            return self._handle_statement_query(any_msg)
-
-        if any_msg.Is(pb2.CommandGetTables.DESCRIPTOR):
-            return self._handle_get_tables(any_msg)
-
-        if any_msg.Is(pb2.CommandGetDbSchemas.DESCRIPTOR):
-            return self._handle_get_db_schemas()
-
-        if any_msg.Is(pb2.CommandGetCatalogs.DESCRIPTOR):
-            return self._handle_get_catalogs()
-
-        raise flight.FlightUnauthenticatedError(
-            f"Unsupported command: {any_msg.type_url}"
-        )
+    # ── Query handlers ────────────────────────────────────────────
 
     def _handle_statement_query(self, any_msg):
         cmd = pb2.CommandStatementQuery()
@@ -200,67 +279,6 @@ class FlightSQLServer(flight.FlightServerBase):
             "catalog_name": pa.array([r[0] for r in rows], type=pa.utf8()),
         })
         return self._stash_and_info(table)
-
-    def _stash_and_info(self, table: pa.Table) -> flight.FlightInfo:
-        handle = uuid.uuid4().bytes
-        with self._stash_lock:
-            self._stash[handle] = (table.schema, table, time.monotonic())
-            self._evict_expired()
-        ticket_msg = pb2.TicketStatementQuery(statement_handle=handle)
-        ticket = flight.Ticket(ticket_msg.SerializeToString())
-        endpoint = flight.FlightEndpoint(ticket, [])
-        return flight.FlightInfo(
-            table.schema,
-            descriptor=flight.FlightDescriptor.for_command(b""),
-            endpoints=[endpoint],
-            total_records=table.num_rows,
-            total_bytes=table.nbytes,
-        )
-
-    def _stash_reader_and_info(self, reader: pa.RecordBatchReader) -> flight.FlightInfo:
-        """Stash a streaming RecordBatchReader for later do_get."""
-        handle = uuid.uuid4().bytes
-        schema = reader.schema
-        with self._stash_lock:
-            self._stash[handle] = (schema, reader, time.monotonic())
-            self._evict_expired()
-        ticket_msg = pb2.TicketStatementQuery(statement_handle=handle)
-        ticket = flight.Ticket(ticket_msg.SerializeToString())
-        endpoint = flight.FlightEndpoint(ticket, [])
-        return flight.FlightInfo(
-            schema,
-            descriptor=flight.FlightDescriptor.for_command(b""),
-            endpoints=[endpoint],
-            total_records=-1,
-            total_bytes=-1,
-        )
-
-    # ── Flight SQL: do_get ────────────────────────────────────────
-
-    def do_get(self, context, ticket):
-        ticket_msg = pb2.TicketStatementQuery()
-        ticket_msg.ParseFromString(ticket.ticket)
-        handle = ticket_msg.statement_handle
-
-        with self._stash_lock:
-            entry = self._stash.pop(handle, None)
-
-        if entry is None:
-            raise flight.FlightServerError("Unknown or expired statement handle")
-
-        _schema, data, _ts = entry
-        # Works for both pa.Table and pa.RecordBatchReader
-        return flight.RecordBatchStream(data)
-
-    # ── Stash maintenance ─────────────────────────────────────────
-
-    def _evict_expired(self):
-        """Remove stash entries older than TTL. Must hold self._stash_lock."""
-        now = time.monotonic()
-        expired = [k for k, (_, _, ts) in self._stash.items()
-                   if now - ts > _STASH_TTL]
-        for k in expired:
-            del self._stash[k]
 
 
 def _duckdb_type_to_arrow(type_str: str) -> pa.DataType:
