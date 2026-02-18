@@ -162,20 +162,24 @@ class FlightSQLServer(_FlightSQLBase):
     def _get_connection(self):
         """Return cached connection, rebuilding only when snapshots change."""
         with self._conn_lock:
-            if self._conn is not None and not self._snapshots_changed():
-                return self._conn
-            if self._conn is not None:
-                try:
-                    self._conn.close()
-                except Exception:
-                    pass
-            self._conn = self._open_connection_fn()
-            self._conn.execute(f"SET memory_limit = '{self._memory_limit}'")
-            self._conn.execute(f"SET threads = {self._threads}")
-            self._record_mtimes()
-            logger.info("connection_rebuilt",
-                        snapshots=len(self._snapshot_paths))
+            return self._get_connection_unlocked()
+
+    def _get_connection_unlocked(self):
+        """Return cached connection.  Caller must hold ``_conn_lock``."""
+        if self._conn is not None and not self._snapshots_changed():
             return self._conn
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+        self._conn = self._open_connection_fn()
+        self._conn.execute(f"SET memory_limit = '{self._memory_limit}'")
+        self._conn.execute(f"SET threads = {self._threads}")
+        self._record_mtimes()
+        logger.info("connection_rebuilt",
+                    snapshots=len(self._snapshot_paths))
+        return self._conn
 
     def _snapshots_changed(self) -> bool:
         for path in self._snapshot_paths:
@@ -202,18 +206,22 @@ class FlightSQLServer(_FlightSQLBase):
         sql = cmd.query
         logger.info("execute_query", sql=sql[:200])
 
-        conn = self._get_connection()
-        result = conn.execute(sql)
-        reader = result.fetch_record_batch(rows_per_batch=50_000)
-        return self._stash_reader_and_info(reader)
+        # Hold _conn_lock for the entire execute→fetch cycle so that
+        # concurrent queries don't invalidate each other's streams.
+        with self._conn_lock:
+            conn = self._get_connection_unlocked()
+            result = conn.execute(sql)
+            table = result.fetch_arrow_table()
+        return self._stash_and_info(table)
 
     def _handle_get_tables(self, any_msg):
         cmd = pb2.CommandGetTables()
         any_msg.Unpack(cmd)
         include_schema = cmd.include_schema
 
-        conn = self._get_connection()
-        rows = conn.execute("SHOW ALL TABLES").fetchall()
+        with self._conn_lock:
+            conn = self._get_connection_unlocked()
+            rows = conn.execute("SHOW ALL TABLES").fetchall()
 
         catalogs, schemas, names, types = [], [], [], []
         schema_bytes_list = []
@@ -254,12 +262,13 @@ class FlightSQLServer(_FlightSQLBase):
         return self._stash_and_info(table)
 
     def _handle_get_db_schemas(self):
-        conn = self._get_connection()
-        rows = conn.execute(
-            "SELECT catalog_name, schema_name "
-            "FROM information_schema.schemata "
-            "ORDER BY catalog_name, schema_name"
-        ).fetchall()
+        with self._conn_lock:
+            conn = self._get_connection_unlocked()
+            rows = conn.execute(
+                "SELECT catalog_name, schema_name "
+                "FROM information_schema.schemata "
+                "ORDER BY catalog_name, schema_name"
+            ).fetchall()
 
         table = pa.table({
             "catalog_name": pa.array([r[0] for r in rows], type=pa.utf8()),
@@ -268,12 +277,13 @@ class FlightSQLServer(_FlightSQLBase):
         return self._stash_and_info(table)
 
     def _handle_get_catalogs(self):
-        conn = self._get_connection()
-        rows = conn.execute(
-            "SELECT DISTINCT catalog_name "
-            "FROM information_schema.schemata "
-            "ORDER BY catalog_name"
-        ).fetchall()
+        with self._conn_lock:
+            conn = self._get_connection_unlocked()
+            rows = conn.execute(
+                "SELECT DISTINCT catalog_name "
+                "FROM information_schema.schemata "
+                "ORDER BY catalog_name"
+            ).fetchall()
 
         table = pa.table({
             "catalog_name": pa.array([r[0] for r in rows], type=pa.utf8()),
