@@ -35,6 +35,7 @@ class Store:
         self,
         db_path: str,
         init_fn: Optional[Callable[[str], duckdb.DuckDBPyConnection]] = None,
+        snapshot: bool = True,
     ):
         """Initialize the store.
 
@@ -43,9 +44,11 @@ class Store:
             init_fn: Optional function to initialize the database.
                 Called with db_path, should return a connection.
                 If None, uses duckdb.connect() directly.
+            snapshot: Whether to refresh snapshots on close/release.
         """
         self.db_path = db_path
         self.conn: Optional[duckdb.DuckDBPyConnection] = None
+        self._snapshot = snapshot
         self._staging_created: set[str] = set()
 
         if init_fn is None:
@@ -97,8 +100,9 @@ class Store:
         if self.conn:
             self.conn.close()
             self.conn = None
-        from stoic.storage.snapshot import refresh_snapshot
-        refresh_snapshot(self.db_path)
+        if self._snapshot:
+            from stoic.storage.snapshot import refresh_snapshot
+            refresh_snapshot(self.db_path)
 
     def reconnect(self) -> None:
         """Reopen DuckDB connection with retry on lock contention.
@@ -426,8 +430,9 @@ class Store:
             self.conn.close()
             self.conn = None
             logger.info("store_closed", db_path=self.db_path)
-        from stoic.storage.snapshot import refresh_snapshot
-        refresh_snapshot(self.db_path)
+        if self._snapshot:
+            from stoic.storage.snapshot import refresh_snapshot
+            refresh_snapshot(self.db_path)
 
 
 # Alias for protocol-aware imports
