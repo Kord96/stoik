@@ -1,7 +1,7 @@
 """Generic FastAPI application factory over Flight SQL.
 
 Provides the HTTP facade layer: lifespan management (FlightPool + EntityCache),
-background warm thread, and dependency injection for routers.
+background warm thread, Prometheus metrics, and dependency injection for routers.
 
 Usage::
 
@@ -23,12 +23,82 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Callable
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from prometheus_client import (
+    Histogram, Counter, generate_latest, CONTENT_TYPE_LATEST,
+)
 
 from .cache import EntityCache
 from .flight_pool import FlightPool
 
 logger = logging.getLogger(__name__)
+
+# ── Prometheus metrics ───────────────────────────────────────────────
+
+_REQUEST_DURATION = Histogram(
+    'http_request_duration_seconds',
+    'HTTP request duration in seconds',
+    ['method', 'endpoint', 'status'],
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120),
+)
+
+_REQUEST_COUNT = Counter(
+    'http_requests_total',
+    'Total HTTP requests',
+    ['method', 'endpoint', 'status'],
+)
+
+
+def _normalize_path(path: str) -> str:
+    """Collapse path parameters to templates for metric labels.
+
+    /node/domain/gmail.com → /node/domain/{key}
+    /node/subnet/1.2.3.0/24/neighbors → /node/subnet/{key}/neighbors
+    """
+    parts = path.strip('/').split('/')
+    if not parts:
+        return path
+
+    # Known top-level routes
+    if parts[0] == 'node' and len(parts) >= 3:
+        # /node/{entity_type}/{key...}[/neighbors|/content]
+        suffix = ''
+        if parts[-1] in ('neighbors', 'content'):
+            suffix = f'/{parts[-1]}'
+            key_parts = parts[2:-1]
+        else:
+            key_parts = parts[2:]
+        if key_parts:
+            return f'/node/{parts[1]}/{{key}}{suffix}'
+    elif parts[0] == 'messages' and len(parts) >= 3:
+        return f'/messages/{parts[1]}/{{key}}'
+    elif parts[0] == 'path' and len(parts) >= 3:
+        return '/path/{src}/to/{tgt}'
+    elif parts[0] == 'resolve':
+        return f'/resolve/{parts[1]}' if len(parts) > 1 else '/resolve'
+
+    return path
+
+
+class _MetricsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        start = time.monotonic()
+        response = await call_next(request)
+        duration = time.monotonic() - start
+
+        endpoint = _normalize_path(request.url.path)
+        status = str(response.status_code)
+        method = request.method
+
+        _REQUEST_DURATION.labels(method, endpoint, status).observe(duration)
+        _REQUEST_COUNT.labels(method, endpoint, status).inc()
+
+        return response
+
+
+# ── Configuration ────────────────────────────────────────────────────
 
 
 @dataclass
@@ -142,6 +212,17 @@ def create_api(config: ApiConfig,
     """
     app = FastAPI(title=title, lifespan=_lifespan)
     app.state.api_config = config
+
+    # Add Prometheus metrics middleware
+    app.add_middleware(_MetricsMiddleware)
+
+    # Add metrics endpoint
+    @app.get('/metrics', include_in_schema=False)
+    async def metrics():
+        return Response(
+            content=generate_latest(),
+            media_type=CONTENT_TYPE_LATEST,
+        )
 
     if routers:
         for router in routers:
