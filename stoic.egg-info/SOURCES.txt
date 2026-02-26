@@ -15,6 +15,7 @@ stoic.egg-info/top_level.txt
 stoic/server/__init__.py
 stoic/server/_protocol.py
 stoic/server/flight.py
+stoic/server/proxy.py
 stoic/storage/__init__.py
 stoic/storage/_protocol.py
 stoic/storage/duckdb.py

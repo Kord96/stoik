@@ -105,7 +105,7 @@ def consume(
             latest_ts = 0
             for msg in msgs:
                 if msg.error():
-                    logger.error("consumer_error", error=str(msg.error()))
+                    m.inc_failed(msg.topic() or 'unknown')
                     continue
 
                 try:

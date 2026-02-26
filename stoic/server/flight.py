@@ -41,6 +41,8 @@ class _FlightSQLBase(flight.FlightServerBase):
         super().__init__(location, **kwargs)
         self._stash: dict[bytes, tuple[pa.Schema, pa.Table, float]] = {}
         self._stash_lock = threading.Lock()
+        self._prepared_stmts: dict[bytes, str] = {}
+        self._prepared_lock = threading.Lock()
 
     # ── Flight SQL: get_flight_info ───────────────────────────────
 
@@ -51,6 +53,9 @@ class _FlightSQLBase(flight.FlightServerBase):
         if any_msg.Is(pb2.CommandStatementQuery.DESCRIPTOR):
             return self._handle_statement_query(any_msg)
 
+        if any_msg.Is(pb2.CommandPreparedStatementQuery.DESCRIPTOR):
+            return self._handle_prepared_statement_query(any_msg)
+
         if any_msg.Is(pb2.CommandGetTables.DESCRIPTOR):
             return self._handle_get_tables(any_msg)
 
@@ -60,9 +65,99 @@ class _FlightSQLBase(flight.FlightServerBase):
         if any_msg.Is(pb2.CommandGetCatalogs.DESCRIPTOR):
             return self._handle_get_catalogs()
 
+        if any_msg.Is(pb2.CommandGetSqlInfo.DESCRIPTOR):
+            return self._handle_get_sql_info(any_msg)
+
         raise flight.FlightUnauthenticatedError(
             f"Unsupported command: {any_msg.type_url}"
         )
+
+    # ── Flight SQL: do_action (prepared statements) ────────────────
+
+    def do_action(self, context, action):
+        if action.type == "CreatePreparedStatement":
+            body = action.body.to_pybytes()
+            # Some clients (e.g. ADBC, Grafana FlightSQL plugin) wrap the
+            # body in google.protobuf.Any; unwrap if needed and remember
+            # so we can wrap the response the same way.
+            any_msg = any_pb2.Any()
+            wrapped_in_any = False
+            try:
+                any_msg.ParseFromString(body)
+            except Exception:
+                any_msg = None
+            if (any_msg is not None
+                    and any_msg.type_url
+                    and any_msg.Is(pb2.ActionCreatePreparedStatementRequest.DESCRIPTOR)):
+                cmd = pb2.ActionCreatePreparedStatementRequest()
+                any_msg.Unpack(cmd)
+                wrapped_in_any = True
+            else:
+                cmd = pb2.ActionCreatePreparedStatementRequest()
+                cmd.ParseFromString(body)
+            sql = cmd.query
+            handle = uuid.uuid4().bytes
+            logger.info("create_prepared_statement", sql=sql[:200])
+            with self._prepared_lock:
+                self._prepared_stmts[handle] = sql
+            result = pb2.ActionCreatePreparedStatementResult(
+                prepared_statement_handle=handle,
+            )
+            # Clients that send Any-wrapped requests (e.g. ADBC Go driver)
+            # expect the response wrapped in Any too.  Sending raw bytes
+            # causes the Go protobuf parser to misinterpret the handle
+            # bytes as a UTF-8 string field, breaking the connection.
+            if wrapped_in_any:
+                wrapper = any_pb2.Any()
+                wrapper.Pack(result)
+                yield flight.Result(wrapper.SerializeToString())
+            else:
+                yield flight.Result(result.SerializeToString())
+            return
+
+        if action.type == "ClosePreparedStatement":
+            body = action.body.to_pybytes()
+            # Unwrap Any if needed (same pattern as CreatePreparedStatement).
+            any_msg = any_pb2.Any()
+            wrapped_in_any = False
+            try:
+                any_msg.ParseFromString(body)
+            except Exception:
+                any_msg = None
+            if (any_msg is not None
+                    and any_msg.type_url
+                    and any_msg.Is(pb2.ActionClosePreparedStatementRequest.DESCRIPTOR)):
+                cmd = pb2.ActionClosePreparedStatementRequest()
+                any_msg.Unpack(cmd)
+                wrapped_in_any = True
+            else:
+                cmd = pb2.ActionClosePreparedStatementRequest()
+                cmd.ParseFromString(body)
+            with self._prepared_lock:
+                self._prepared_stmts.pop(cmd.prepared_statement_handle, None)
+            # ClosePreparedStatement has no structured result; respond
+            # with empty bytes regardless of wrapping style.
+            yield flight.Result(b"")
+            return
+
+        raise flight.FlightUnauthenticatedError(
+            f"Unsupported action: {action.type}"
+        )
+
+    def _handle_prepared_statement_query(self, any_msg):
+        """Execute a previously prepared statement."""
+        cmd = pb2.CommandPreparedStatementQuery()
+        any_msg.Unpack(cmd)
+        handle = cmd.prepared_statement_handle
+        with self._prepared_lock:
+            sql = self._prepared_stmts.get(handle)
+        if sql is None:
+            raise flight.FlightServerError("Unknown prepared statement handle")
+        # Delegate to statement query with the stored SQL
+        logger.info("execute_prepared_query", sql=sql[:200])
+        wrapped = any_pb2.Any()
+        wrapped.Pack(pb2.CommandStatementQuery(query=sql))
+        return self._handle_statement_query(wrapped)
 
     # ── Flight SQL: do_get ────────────────────────────────────────
 
@@ -147,21 +242,38 @@ class FlightSQLServer(_FlightSQLBase):
                  snapshot_paths: tuple[str, ...] = (),
                  memory_limit: str = '8GB',
                  threads: int = 4,
+                 pool_size: int = 4,
                  **kwargs):
         super().__init__(location, **kwargs)
+        self._pool_size = pool_size
         self._open_connection_fn = open_connection
         self._snapshot_paths = list(snapshot_paths)
         self._memory_limit = memory_limit
         self._threads = threads
         self._conn = None
-        self._conn_lock = threading.Lock()
+        self._conn_lock = threading.RLock()
         self._snapshot_mtimes: dict[str, float] = {}
+        self._last_mtime_check: float = 0.0
+        self._mtime_check_interval: float = 60.0  # seconds between mtime checks
+
+        # Background thread: check for snapshot changes and rebuild
+        # proactively so queries never hit the cold-rebuild penalty.
+        self._refresh_stop = threading.Event()
+        self._refresh_thread = threading.Thread(
+            target=self._background_refresh, daemon=True,
+            name="flight-snapshot-refresh")
+        self._refresh_thread.start()
 
     # ── Connection caching ────────────────────────────────────────
 
     def _get_connection(self):
         """Return cached connection, rebuilding only when snapshots change."""
         with self._conn_lock:
+            now = time.monotonic()
+            if (self._conn is not None
+                    and now - self._last_mtime_check < self._mtime_check_interval):
+                return self._conn
+            self._last_mtime_check = now
             if self._conn is not None and not self._snapshots_changed():
                 return self._conn
             if self._conn is not None:
@@ -194,26 +306,69 @@ class FlightSQLServer(_FlightSQLBase):
             except OSError:
                 pass
 
+    def _background_refresh(self):
+        """Periodically check snapshots and rebuild connection in background.
+
+        Builds immediately on startup, then every _mtime_check_interval
+        seconds.  New connections are built outside the lock so queries
+        against the old connection aren't blocked.
+        """
+        first = True
+        while not self._refresh_stop.is_set():
+            if not first:
+                self._refresh_stop.wait(self._mtime_check_interval)
+                if self._refresh_stop.is_set():
+                    break
+            first = False
+            try:
+                with self._conn_lock:
+                    if self._conn is not None and not self._snapshots_changed():
+                        continue
+                    old = self._conn
+                new_conn = self._open_connection_fn()
+                new_conn.execute(f"SET memory_limit = '{self._memory_limit}'")
+                new_conn.execute(f"SET threads = {self._threads}")
+                with self._conn_lock:
+                    self._conn = new_conn
+                    self._record_mtimes()
+                    self._last_mtime_check = time.monotonic()
+                if old is not None:
+                    try:
+                        old.close()
+                    except Exception:
+                        pass
+                logger.info("connection_rebuilt_bg",
+                            snapshots=len(self._snapshot_paths))
+            except Exception:
+                logger.warning("bg_refresh_failed", exc_info=True)
+
     # ── Query handlers ────────────────────────────────────────────
 
     def _handle_statement_query(self, any_msg):
         cmd = pb2.CommandStatementQuery()
         any_msg.Unpack(cmd)
-        sql = cmd.query
+        sql = cmd.query.strip()
+        if not sql:
+            # Some clients (e.g. Grafana FlightSQL plugin) send empty SQL
+            # as an initialization probe.  Return an empty table.
+            table = pa.table({'ok': pa.array([1], type=pa.int32())})
+            return self._stash_and_info(table)
         logger.info("execute_query", sql=sql[:200])
 
-        conn = self._get_connection()
-        result = conn.execute(sql)
-        reader = result.fetch_record_batch(rows_per_batch=50_000)
-        return self._stash_reader_and_info(reader)
+        with self._conn_lock:
+            conn = self._get_connection()
+            result = conn.execute(sql)
+            table = result.fetch_record_batch(rows_per_batch=50_000).read_all()
+        return self._stash_and_info(table)
 
     def _handle_get_tables(self, any_msg):
         cmd = pb2.CommandGetTables()
         any_msg.Unpack(cmd)
         include_schema = cmd.include_schema
 
-        conn = self._get_connection()
-        rows = conn.execute("SHOW ALL TABLES").fetchall()
+        with self._conn_lock:
+            conn = self._get_connection()
+            rows = conn.execute("SHOW ALL TABLES").fetchall()
 
         catalogs, schemas, names, types = [], [], [], []
         schema_bytes_list = []
@@ -254,12 +409,13 @@ class FlightSQLServer(_FlightSQLBase):
         return self._stash_and_info(table)
 
     def _handle_get_db_schemas(self):
-        conn = self._get_connection()
-        rows = conn.execute(
-            "SELECT catalog_name, schema_name "
-            "FROM information_schema.schemata "
-            "ORDER BY catalog_name, schema_name"
-        ).fetchall()
+        with self._conn_lock:
+            conn = self._get_connection()
+            rows = conn.execute(
+                "SELECT catalog_name, schema_name "
+                "FROM information_schema.schemata "
+                "ORDER BY catalog_name, schema_name"
+            ).fetchall()
 
         table = pa.table({
             "catalog_name": pa.array([r[0] for r in rows], type=pa.utf8()),
@@ -268,15 +424,42 @@ class FlightSQLServer(_FlightSQLBase):
         return self._stash_and_info(table)
 
     def _handle_get_catalogs(self):
-        conn = self._get_connection()
-        rows = conn.execute(
-            "SELECT DISTINCT catalog_name "
-            "FROM information_schema.schemata "
-            "ORDER BY catalog_name"
-        ).fetchall()
+        with self._conn_lock:
+            conn = self._get_connection()
+            rows = conn.execute(
+                "SELECT DISTINCT catalog_name "
+                "FROM information_schema.schemata "
+                "ORDER BY catalog_name"
+            ).fetchall()
 
         table = pa.table({
             "catalog_name": pa.array([r[0] for r in rows], type=pa.utf8()),
+        })
+        return self._stash_and_info(table)
+
+    def _handle_get_sql_info(self, any_msg):
+        """Return minimal SQL info metadata for ADBC client initialization."""
+        # The SqlInfo response is a dense union table.  Construct an
+        # empty table with the correct schema to satisfy the ADBC client.
+        children = [
+            pa.array([], type=pa.utf8()),
+            pa.array([], type=pa.bool_()),
+            pa.array([], type=pa.int64()),
+            pa.array([], type=pa.int32()),
+            pa.array([], type=pa.list_(pa.utf8())),
+            pa.array([], type=pa.map_(pa.int32(), pa.list_(pa.int32()))),
+        ]
+        type_ids = pa.array([], type=pa.int8())
+        offsets = pa.array([], type=pa.int32())
+        union_arr = pa.UnionArray.from_dense(
+            type_ids, offsets, children,
+            field_names=["string_value", "bool_value", "bigint_value",
+                         "int32_bitmask", "string_list",
+                         "int32_to_int32_list_map"],
+        )
+        table = pa.table({
+            "info_name": pa.array([], type=pa.uint32()),
+            "value": union_arr,
         })
         return self._stash_and_info(table)
 

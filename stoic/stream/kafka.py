@@ -2,14 +2,23 @@
 
 Deserialization is pushed into the stream plug so the generic loop
 receives pre-deserialized Message.value() objects.
+
+Includes automatic reconnection when the broker becomes unreachable
+(e.g. librdkafka REQTMOUT loop after prolonged broker unavailability).
 """
 
 import json
+import time
 from typing import Callable, Optional
 
 import structlog
 
 logger = structlog.get_logger()
+
+# Number of consecutive errors before triggering reconnect
+_RECONNECT_THRESHOLD = 10
+# Seconds without any successful message before reconnect (when errors present)
+_IDLE_RECONNECT_SECS = 120
 
 
 class KafkaMessage:
@@ -45,6 +54,10 @@ class KafkaStream:
     Handles deserialization (JSON / Avro / custom) internally.
     poll() filters out partition EOF and returns only data messages
     (plus real error messages).
+
+    Automatically reconnects when consecutive errors exceed the
+    threshold or when no successful messages arrive for too long
+    while errors are present.
     """
 
     def __init__(
@@ -57,9 +70,9 @@ class KafkaStream:
         consumer_config: Optional[dict] = None,
         value_deserializer: Optional[Callable] = None,
     ):
-        from confluent_kafka import Consumer
-
-        config = {
+        self._broker = broker
+        self._group_id = group_id
+        self._base_config = {
             'bootstrap.servers': broker,
             'group.id': group_id,
             'auto.offset.reset': 'earliest',
@@ -70,13 +83,26 @@ class KafkaStream:
             'max.poll.interval.ms': 1800000,   # 30 min
         }
         if consumer_config:
-            config.update(consumer_config)
+            self._base_config.update(consumer_config)
 
-        self._consumer = Consumer(config)
-        self._group_id = group_id
+        self._deser_mode = deserializer
+        self._schema_registry_url = schema_registry_url
+        self._value_deserializer = value_deserializer
+        self._topics: list[str] = []
+
+        # Error tracking for reconnection
+        self._consecutive_errors = 0
+        self._last_success = time.monotonic()
+        self._first_error_at = 0.0
+
+        self._consumer = self._create_consumer()
         self._deserialize_fn = self._build_deserializer(
             deserializer, schema_registry_url, value_deserializer,
         )
+
+    def _create_consumer(self):
+        from confluent_kafka import Consumer
+        return Consumer(self._base_config)
 
     @staticmethod
     def _build_deserializer(
@@ -109,28 +135,98 @@ class KafkaStream:
         return _json
 
     def subscribe(self, topics: list[str]) -> None:
+        self._topics = list(topics)
         self._consumer.subscribe(topics)
         logger.info("kafka_subscribed", topics=topics, group=self._group_id)
+
+    def reconnect(self) -> None:
+        """Close the current consumer and create a fresh one.
+
+        Re-subscribes to the same topics. Committed offsets are preserved
+        in the broker, so consumption resumes from where it left off.
+        """
+        logger.warning("kafka_reconnecting",
+                        group=self._group_id,
+                        consecutive_errors=self._consecutive_errors)
+        try:
+            self._consumer.close()
+        except Exception:
+            pass
+
+        time.sleep(2)  # Brief pause before reconnecting
+
+        self._consumer = self._create_consumer()
+        self._deserialize_fn = self._build_deserializer(
+            self._deser_mode, self._schema_registry_url,
+            self._value_deserializer,
+        )
+        if self._topics:
+            self._consumer.subscribe(self._topics)
+            logger.info("kafka_resubscribed",
+                        topics=self._topics, group=self._group_id)
+
+        self._consecutive_errors = 0
+        self._first_error_at = 0.0
+        self._last_success = time.monotonic()
+
+    def _check_reconnect_needed(self) -> bool:
+        """Return True if error pattern warrants reconnection."""
+        if self._consecutive_errors >= _RECONNECT_THRESHOLD:
+            return True
+        if (self._first_error_at > 0
+                and time.monotonic() - self._first_error_at > _IDLE_RECONNECT_SECS):
+            return True
+        return False
 
     def poll(self, batch_size: int, timeout: float) -> list[KafkaMessage]:
         """Poll up to *batch_size* messages, filtering partition EOF."""
         from confluent_kafka import KafkaError
 
-        raw_msgs = self._consumer.consume(batch_size, timeout=timeout)
+        try:
+            raw_msgs = self._consumer.consume(batch_size, timeout=timeout)
+        except Exception as exc:
+            logger.error("kafka_consume_exception", error=str(exc),
+                         group=self._group_id)
+            self._consecutive_errors += 1
+            if not self._first_error_at:
+                self._first_error_at = time.monotonic()
+            if self._check_reconnect_needed():
+                self.reconnect()
+            return []
+
         if not raw_msgs:
             return []
 
         result = []
+        had_data = False
         for msg in raw_msgs:
             err = msg.error()
             if err:
                 if err.code() == KafkaError._PARTITION_EOF:
                     continue
+                self._consecutive_errors += 1
+                if not self._first_error_at:
+                    self._first_error_at = time.monotonic()
                 # Wrap real errors so the loop can inspect .error()
                 result.append(KafkaMessage(msg, self._deserialize_fn))
             else:
+                had_data = True
                 result.append(KafkaMessage(msg, self._deserialize_fn))
+
+        if had_data:
+            self._consecutive_errors = 0
+            self._first_error_at = 0.0
+            self._last_success = time.monotonic()
+
+        # Check if reconnect needed after processing batch
+        if self._check_reconnect_needed():
+            self.reconnect()
+            return []  # Discard error-only batch, fresh poll on next call
+
         return result
 
     def close(self) -> None:
-        self._consumer.close()
+        try:
+            self._consumer.close()
+        except Exception:
+            pass

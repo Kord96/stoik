@@ -17,7 +17,7 @@ import structlog
 logger = structlog.get_logger()
 
 # Retry configuration
-MAX_RETRIES = 10
+MAX_RETRIES = 60
 BASE_DELAY = 0.1   # 100 ms
 MAX_DELAY = 5.0    # 5 s cap
 JITTER = 0.5       # +/- 50%
@@ -247,7 +247,7 @@ class Store:
     def merge_staging(
         self,
         table_name: str,
-        merge_sql: str,
+        merge_sql: 'str | callable',
         *,
         max_merge_rows: int = 0,
         pre_aggregate_sql: str = '',
@@ -256,9 +256,12 @@ class Store:
 
         Args:
             table_name: Main table name.
-            merge_sql: SQL that reads from {table_name}_staging and
-                writes into {table_name}.  Typically an INSERT...SELECT
-                with GROUP BY and ON CONFLICT for pre-aggregation.
+            merge_sql: SQL string or callable(conn) that reads from
+                {table_name}_staging and writes into {table_name}.
+                If a string, typically an INSERT...SELECT with GROUP BY
+                and ON CONFLICT for pre-aggregation.  If a callable,
+                receives the DuckDB connection and should perform the
+                merge (useful for multi-step UPDATE + INSERT merges).
             max_merge_rows: If > 0, merge in batches of this size
                 instead of all at once.  Prevents OOM on very large
                 staging tables by renaming the staging table and
@@ -300,18 +303,18 @@ class Store:
                     logger.info("staging_recovered_rename",
                                 table=table_name, stale_table=stale)
                 else:
-                    # Both exist; merge stale rows into staging
+                    # Both exist — stale leftover from a crashed merge.
+                    # Drop the stale table rather than trying to INSERT
+                    # potentially billions of rows (which can OOM).
+                    # The rows in _staging already cover newer observations.
                     stale_n = self.conn.execute(
                         f'SELECT COUNT(*) FROM {stale}'
                     ).fetchone()[0]
-                    if stale_n > 0:
-                        self.conn.execute(
-                            f'INSERT INTO {staging} SELECT * FROM {stale}')
-                        logger.info("staging_recovered_stale",
-                                    table=table_name, stale_table=stale,
-                                    rows=stale_n)
                     self.conn.execute(f'DROP TABLE {stale}')
                     self.conn.commit()
+                    logger.info("staging_recovered_drop",
+                                table=table_name, stale_table=stale,
+                                dropped_rows=stale_n)
 
             if not has_staging:
                 return 0
@@ -326,7 +329,10 @@ class Store:
 
             if max_merge_rows <= 0 or n <= max_merge_rows:
                 # Single merge — original fast path
-                self.conn.execute(merge_sql)
+                if callable(merge_sql):
+                    merge_sql(self.conn)
+                else:
+                    self.conn.execute(merge_sql)
                 self.conn.execute(f'DROP TABLE {staging}')
                 self.conn.commit()
                 self._staging_created.discard(table_name)
@@ -359,7 +365,10 @@ class Store:
                     self.conn.execute(
                         f'ALTER TABLE {staging_all} RENAME TO {staging}')
                     self.conn.commit()
-                    self.conn.execute(merge_sql)
+                    if callable(merge_sql):
+                        merge_sql(self.conn)
+                    else:
+                        self.conn.execute(merge_sql)
                     self.conn.execute(f'DROP TABLE {staging}')
                     self.conn.commit()
                     self._staging_created.discard(table_name)
@@ -385,7 +394,10 @@ class Store:
                     break
 
                 # Run caller-provided merge SQL (reads {staging})
-                self.conn.execute(merge_sql)
+                if callable(merge_sql):
+                    merge_sql(self.conn)
+                else:
+                    self.conn.execute(merge_sql)
                 merged += batch_n
                 self.conn.execute(f'DROP TABLE {staging}')
 
