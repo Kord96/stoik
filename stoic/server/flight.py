@@ -269,25 +269,29 @@ class FlightSQLServer(_FlightSQLBase):
     def _get_connection(self):
         """Return cached connection, rebuilding only when snapshots change."""
         with self._conn_lock:
-            now = time.monotonic()
-            if (self._conn is not None
-                    and now - self._last_mtime_check < self._mtime_check_interval):
-                return self._conn
-            self._last_mtime_check = now
-            if self._conn is not None and not self._snapshots_changed():
-                return self._conn
-            if self._conn is not None:
-                try:
-                    self._conn.close()
-                except Exception:
-                    pass
-            self._conn = self._open_connection_fn()
-            self._conn.execute(f"SET memory_limit = '{self._memory_limit}'")
-            self._conn.execute(f"SET threads = {self._threads}")
-            self._record_mtimes()
-            logger.info("connection_rebuilt",
-                        snapshots=len(self._snapshot_paths))
+            return self._get_connection_unlocked()
+
+    def _get_connection_unlocked(self):
+        """Return cached connection.  Caller must hold ``_conn_lock``."""
+        now = time.monotonic()
+        if (self._conn is not None
+                and now - self._last_mtime_check < self._mtime_check_interval):
             return self._conn
+        self._last_mtime_check = now
+        if self._conn is not None and not self._snapshots_changed():
+            return self._conn
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+        self._conn = self._open_connection_fn()
+        self._conn.execute(f"SET memory_limit = '{self._memory_limit}'")
+        self._conn.execute(f"SET threads = {self._threads}")
+        self._record_mtimes()
+        logger.info("connection_rebuilt",
+                    snapshots=len(self._snapshot_paths))
+        return self._conn
 
     def _snapshots_changed(self) -> bool:
         for path in self._snapshot_paths:
@@ -355,10 +359,12 @@ class FlightSQLServer(_FlightSQLBase):
             return self._stash_and_info(table)
         logger.info("execute_query", sql=sql[:200])
 
+        # Hold _conn_lock for the entire execute→fetch cycle so that
+        # concurrent queries don't invalidate each other's streams.
         with self._conn_lock:
-            conn = self._get_connection()
+            conn = self._get_connection_unlocked()
             result = conn.execute(sql)
-            table = result.fetch_record_batch(rows_per_batch=50_000).read_all()
+            table = result.fetch_arrow_table()
         return self._stash_and_info(table)
 
     def _handle_get_tables(self, any_msg):
@@ -367,7 +373,7 @@ class FlightSQLServer(_FlightSQLBase):
         include_schema = cmd.include_schema
 
         with self._conn_lock:
-            conn = self._get_connection()
+            conn = self._get_connection_unlocked()
             rows = conn.execute("SHOW ALL TABLES").fetchall()
 
         catalogs, schemas, names, types = [], [], [], []
@@ -410,7 +416,7 @@ class FlightSQLServer(_FlightSQLBase):
 
     def _handle_get_db_schemas(self):
         with self._conn_lock:
-            conn = self._get_connection()
+            conn = self._get_connection_unlocked()
             rows = conn.execute(
                 "SELECT catalog_name, schema_name "
                 "FROM information_schema.schemata "
@@ -425,7 +431,7 @@ class FlightSQLServer(_FlightSQLBase):
 
     def _handle_get_catalogs(self):
         with self._conn_lock:
-            conn = self._get_connection()
+            conn = self._get_connection_unlocked()
             rows = conn.execute(
                 "SELECT DISTINCT catalog_name "
                 "FROM information_schema.schemata "
