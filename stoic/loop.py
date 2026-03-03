@@ -18,13 +18,54 @@ from stoic.metrics import MetricsHook, NoopMetrics
 logger = structlog.get_logger()
 
 
-def _do_flush(m, buffer, store, on_flush):
+def _flush_with_heartbeat(consumer, on_flush):
+    """Run flush in a background thread while keeping Kafka heartbeat alive.
+
+    Pauses all assigned partitions so poll() returns no messages (no
+    auto-commit advancement, no data loss).  The main thread keeps calling
+    consumer.poll() which triggers librdkafka's internal heartbeat and
+    rebalance processing — preventing session timeouts regardless of how
+    long the flush takes.
+    """
+    assignment = consumer.assignment()
+    if assignment:
+        consumer.pause(assignment)
+
+    exc_holder = [None]
+
+    def _run():
+        try:
+            on_flush()
+        except Exception as e:
+            exc_holder[0] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+    while t.is_alive():
+        consumer.poll(timeout=1.0)
+        t.join(timeout=0)
+
+    if assignment:
+        consumer.resume(assignment)
+
+    if exc_holder[0] is not None:
+        raise exc_holder[0]
+
+
+def _do_flush(m, buffer, store, on_flush, stream=None):
     """Execute a flush with metrics instrumentation."""
     m.set_buffer_size(buffer.count)
     if store:
         store.reconnect()
     t0 = time.monotonic()
-    on_flush()
+
+    consumer = getattr(stream, '_consumer', None) if stream else None
+    if consumer is not None:
+        _flush_with_heartbeat(consumer, on_flush)
+    else:
+        on_flush()
+
     m.observe_flush(time.monotonic() - t0)
     m.inc_flush_entities(buffer.count)
     buffer.mark_flushed()
@@ -99,7 +140,7 @@ def consume(
                     max_size=max_batch,
                     min_size=min_batch,
                 ):
-                    _do_flush(m, buffer, store, on_flush)
+                    _do_flush(m, buffer, store, on_flush, stream)
                 continue
 
             latest_ts = 0
@@ -127,7 +168,7 @@ def consume(
                 m.set_latest_event_ts(latest_ts / 1000.0)
 
             if buffer.should_flush(interval=flush_interval, max_size=max_batch):
-                _do_flush(m, buffer, store, on_flush)
+                _do_flush(m, buffer, store, on_flush, stream)
 
             # Periodic compaction
             if compact_callback and time.time() - last_compact >= compact_interval:

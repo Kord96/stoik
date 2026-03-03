@@ -26,6 +26,9 @@ logger = structlog.get_logger()
 # Stash entry TTL in seconds.
 _STASH_TTL = 60
 
+# Default query cache TTL in seconds.
+_QUERY_CACHE_TTL = 300  # 5 min
+
 
 class _FlightSQLBase(flight.FlightServerBase):
     """Base class providing stash management and Flight SQL request routing.
@@ -224,17 +227,22 @@ class _FlightSQLBase(flight.FlightServerBase):
 
 
 class FlightSQLServer(_FlightSQLBase):
-    """Flight SQL server that queries a cached DuckDB connection.
+    """Flight SQL server backed by a pool of cached DuckDB connections.
+
+    Queries are distributed round-robin across ``pool_size`` independent
+    DuckDB connections, each protected by its own lock.  This allows
+    concurrent panel queries (e.g. from Grafana) to execute in parallel
+    instead of serializing through a single connection.
 
     Args:
         location: gRPC bind address (e.g. ``grpc://0.0.0.0:8815``).
         open_connection: Callable that returns a fresh DuckDB connection
             with all desired databases ATTACHed.
         snapshot_paths: File paths to monitor for mtime changes.  When
-            any file's mtime changes, the cached connection is rebuilt
-            on the next query.
+            any file's mtime changes, pool connections are rebuilt.
         memory_limit: DuckDB per-connection memory limit.
         threads: DuckDB thread count per connection.
+        pool_size: Number of DuckDB connections in the pool.
     """
 
     def __init__(self, location: str, *,
@@ -245,16 +253,26 @@ class FlightSQLServer(_FlightSQLBase):
                  pool_size: int = 4,
                  **kwargs):
         super().__init__(location, **kwargs)
-        self._pool_size = pool_size
+        self._pool_size = max(1, pool_size)
         self._open_connection_fn = open_connection
         self._snapshot_paths = list(snapshot_paths)
         self._memory_limit = memory_limit
         self._threads = threads
-        self._conn = None
-        self._conn_lock = threading.RLock()
+
+        # Connection pool: each slot has its own connection + lock so
+        # concurrent queries on different slots run in parallel.
+        self._pool: list = [None] * self._pool_size
+        self._pool_locks = [threading.Lock() for _ in range(self._pool_size)]
+        self._pool_counter = 0
+        self._pool_counter_lock = threading.Lock()
+
         self._snapshot_mtimes: dict[str, float] = {}
-        self._last_mtime_check: float = 0.0
         self._mtime_check_interval: float = 60.0  # seconds between mtime checks
+
+        # Query result cache: sql -> (pa.Table, monotonic_timestamp)
+        self._query_cache: dict[str, tuple[pa.Table, float]] = {}
+        self._query_cache_lock = threading.Lock()
+        self._query_cache_ttl = _QUERY_CACHE_TTL
 
         # Background thread: check for snapshot changes and rebuild
         # proactively so queries never hit the cold-rebuild penalty.
@@ -264,34 +282,34 @@ class FlightSQLServer(_FlightSQLBase):
             name="flight-snapshot-refresh")
         self._refresh_thread.start()
 
-    # ── Connection caching ────────────────────────────────────────
+    # ── Connection pool ────────────────────────────────────────────
 
-    def _get_connection(self):
-        """Return cached connection, rebuilding only when snapshots change."""
-        with self._conn_lock:
-            return self._get_connection_unlocked()
+    def _next_pool_idx(self) -> int:
+        """Return the next pool index (round-robin)."""
+        with self._pool_counter_lock:
+            idx = self._pool_counter % self._pool_size
+            self._pool_counter += 1
+            return idx
 
-    def _get_connection_unlocked(self):
-        """Return cached connection.  Caller must hold ``_conn_lock``."""
-        now = time.monotonic()
-        if (self._conn is not None
-                and now - self._last_mtime_check < self._mtime_check_interval):
-            return self._conn
-        self._last_mtime_check = now
-        if self._conn is not None and not self._snapshots_changed():
-            return self._conn
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception:
-                pass
-        self._conn = self._open_connection_fn()
-        self._conn.execute(f"SET memory_limit = '{self._memory_limit}'")
-        self._conn.execute(f"SET threads = {self._threads}")
-        self._record_mtimes()
-        logger.info("connection_rebuilt",
-                    snapshots=len(self._snapshot_paths))
-        return self._conn
+    def _build_connection(self):
+        """Create a new DuckDB connection with memory/thread settings."""
+        conn = self._open_connection_fn()
+        conn.execute(f"SET memory_limit = '{self._memory_limit}'")
+        conn.execute(f"SET threads = {self._threads}")
+        return conn
+
+    def _execute_on_pool(self, fn):
+        """Acquire a pool connection, run ``fn(conn)``, release.
+
+        ``fn`` receives a DuckDB connection and must return its result
+        before the lock is released (e.g. fetch all rows).
+        """
+        idx = self._next_pool_idx()
+        with self._pool_locks[idx]:
+            if self._pool[idx] is None:
+                self._pool[idx] = self._build_connection()
+                logger.info("pool_connection_created", pool_idx=idx)
+            return fn(self._pool[idx])
 
     def _snapshots_changed(self) -> bool:
         for path in self._snapshot_paths:
@@ -311,11 +329,12 @@ class FlightSQLServer(_FlightSQLBase):
                 pass
 
     def _background_refresh(self):
-        """Periodically check snapshots and rebuild connection in background.
+        """Periodically check snapshots and rebuild pool connections.
 
-        Builds immediately on startup, then every _mtime_check_interval
-        seconds.  New connections are built outside the lock so queries
-        against the old connection aren't blocked.
+        Builds all connections immediately on startup, then checks for
+        mtime changes every ``_mtime_check_interval`` seconds.  Each
+        pool slot is rebuilt individually so other slots remain available
+        for queries during the rebuild.
         """
         first = True
         while not self._refresh_stop.is_set():
@@ -325,23 +344,32 @@ class FlightSQLServer(_FlightSQLBase):
                     break
             first = False
             try:
-                with self._conn_lock:
-                    if self._conn is not None and not self._snapshots_changed():
-                        continue
-                    old = self._conn
-                new_conn = self._open_connection_fn()
-                new_conn.execute(f"SET memory_limit = '{self._memory_limit}'")
-                new_conn.execute(f"SET threads = {self._threads}")
-                with self._conn_lock:
-                    self._conn = new_conn
-                    self._record_mtimes()
-                    self._last_mtime_check = time.monotonic()
-                if old is not None:
+                # Skip rebuild if snapshots haven't changed and pool is populated
+                if (not self._snapshots_changed()
+                        and all(c is not None for c in self._pool)):
+                    continue
+                # Rebuild each pool slot one at a time
+                for idx in range(self._pool_size):
                     try:
-                        old.close()
+                        new_conn = self._build_connection()
                     except Exception:
-                        pass
-                logger.info("connection_rebuilt_bg",
+                        logger.warning("bg_refresh_connection_failed",
+                                       pool_idx=idx, exc_info=True)
+                        continue
+                    with self._pool_locks[idx]:
+                        old = self._pool[idx]
+                        self._pool[idx] = new_conn
+                    if old is not None:
+                        try:
+                            old.close()
+                        except Exception:
+                            pass
+                self._record_mtimes()
+                # Clear query cache — data has changed
+                with self._query_cache_lock:
+                    self._query_cache.clear()
+                logger.info("pool_refreshed",
+                            pool_size=self._pool_size,
                             snapshots=len(self._snapshot_paths))
             except Exception:
                 logger.warning("bg_refresh_failed", exc_info=True)
@@ -357,14 +385,37 @@ class FlightSQLServer(_FlightSQLBase):
             # as an initialization probe.  Return an empty table.
             table = pa.table({'ok': pa.array([1], type=pa.int32())})
             return self._stash_and_info(table)
+
+        # Check query cache
+        now = time.monotonic()
+        with self._query_cache_lock:
+            cached = self._query_cache.get(sql)
+            if cached is not None:
+                table, ts = cached
+                if now - ts < self._query_cache_ttl:
+                    logger.info("cache_hit", sql=sql[:200],
+                                age_s=round(now - ts, 1))
+                    return self._stash_and_info(table)
+                # Expired — remove
+                del self._query_cache[sql]
+
         logger.info("execute_query", sql=sql[:200])
 
-        # Hold _conn_lock for the entire execute→fetch cycle so that
-        # concurrent queries don't invalidate each other's streams.
-        with self._conn_lock:
-            conn = self._get_connection_unlocked()
+        def run(conn):
             result = conn.execute(sql)
-            table = result.fetch_arrow_table()
+            return result.fetch_arrow_table()
+
+        table = self._execute_on_pool(run)
+
+        # Cache the result
+        with self._query_cache_lock:
+            self._query_cache[sql] = (table, time.monotonic())
+            # Evict entries older than TTL
+            expired = [k for k, (_, ts) in self._query_cache.items()
+                       if now - ts >= self._query_cache_ttl]
+            for k in expired:
+                del self._query_cache[k]
+
         return self._stash_and_info(table)
 
     def _handle_get_tables(self, any_msg):
@@ -372,9 +423,8 @@ class FlightSQLServer(_FlightSQLBase):
         any_msg.Unpack(cmd)
         include_schema = cmd.include_schema
 
-        with self._conn_lock:
-            conn = self._get_connection_unlocked()
-            rows = conn.execute("SHOW ALL TABLES").fetchall()
+        rows = self._execute_on_pool(
+            lambda conn: conn.execute("SHOW ALL TABLES").fetchall())
 
         catalogs, schemas, names, types = [], [], [], []
         schema_bytes_list = []
@@ -415,13 +465,12 @@ class FlightSQLServer(_FlightSQLBase):
         return self._stash_and_info(table)
 
     def _handle_get_db_schemas(self):
-        with self._conn_lock:
-            conn = self._get_connection_unlocked()
-            rows = conn.execute(
+        rows = self._execute_on_pool(
+            lambda conn: conn.execute(
                 "SELECT catalog_name, schema_name "
                 "FROM information_schema.schemata "
                 "ORDER BY catalog_name, schema_name"
-            ).fetchall()
+            ).fetchall())
 
         table = pa.table({
             "catalog_name": pa.array([r[0] for r in rows], type=pa.utf8()),
@@ -430,13 +479,12 @@ class FlightSQLServer(_FlightSQLBase):
         return self._stash_and_info(table)
 
     def _handle_get_catalogs(self):
-        with self._conn_lock:
-            conn = self._get_connection_unlocked()
-            rows = conn.execute(
+        rows = self._execute_on_pool(
+            lambda conn: conn.execute(
                 "SELECT DISTINCT catalog_name "
                 "FROM information_schema.schemata "
                 "ORDER BY catalog_name"
-            ).fetchall()
+            ).fetchall())
 
         table = pa.table({
             "catalog_name": pa.array([r[0] for r in rows], type=pa.utf8()),
