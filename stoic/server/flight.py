@@ -550,7 +550,7 @@ def _duckdb_type_to_arrow(type_str: str) -> pa.DataType:
     if t == 'DATE':
         return pa.date32()
     if t in ('TIMESTAMP', 'DATETIME'):
-        return pa.timestamp('us')
+        return pa.timestamp('us', tz='UTC')
     if t == 'TIMESTAMP WITH TIME ZONE':
         return pa.timestamp('us', tz='UTC')
     if t == 'UUID':
