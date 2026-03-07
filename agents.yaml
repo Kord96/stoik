@@ -1,0 +1,35 @@
+name: stoic
+install: pip install stoic-pipeline
+pypi: stoic-pipeline
+
+purpose: |
+  Stream-to-store pipeline framework.
+  Kafka → buffer → batch flush → DuckDB.
+  Handles backpressure, retries, and exactly-once delivery.
+
+when_to_use: |
+  - Ingesting data from Kafka into DuckDB or other stores
+  - Event processing with buffered batch writes
+  - Stream pipelines that need backpressure and retry logic
+
+design:
+  pattern: "producer → buffer → consumer"
+  key_classes:
+    - StoicProducer: "Kafka producer with delivery callbacks"
+    - StoicBuffer: "In-memory buffer with flush triggers (size/time)"
+    - StoicConsumer: "Kafka consumer with commit tracking"
+    - StoicServer: "FastAPI + FlightSQL server for serving stored data"
+
+monitoring:
+  metrics_prefix: stoic_
+  key_metrics:
+    - stoic_messages_consumed_total
+    - stoic_messages_produced_total
+    - stoic_buffer_flush_total
+    - stoic_buffer_flush_duration_seconds
+    - stoic_errors_total
+
+testing:
+  config_file: config.py
+  skip_tests:
+    - test_constants_in_config
