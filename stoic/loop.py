@@ -55,7 +55,8 @@ def _flush_with_heartbeat(consumer, on_flush):
 
 def _do_flush(m, buffer, store, on_flush, stream=None):
     """Execute a flush with metrics instrumentation."""
-    m.set_buffer_size(buffer.count)
+    count = buffer.count
+    m.set_buffer_size(count)
     if store:
         store.reconnect()
     t0 = time.monotonic()
@@ -66,10 +67,18 @@ def _do_flush(m, buffer, store, on_flush, stream=None):
     else:
         on_flush()
 
-    m.observe_flush(time.monotonic() - t0)
-    m.inc_flush_entities(buffer.count)
+    elapsed = time.monotonic() - t0
+    m.observe_flush(elapsed)
+    m.inc_flush_entities(count)
     buffer.mark_flushed()
     m.set_buffer_size(0)
+
+    if elapsed > 600:
+        logger.warning("flush_slow", duration_s=round(elapsed, 1),
+                       entities=count, threshold_s=600)
+    elif elapsed > 300:
+        logger.warning("flush_slow", duration_s=round(elapsed, 1),
+                       entities=count, threshold_s=300)
     if store and hasattr(store, 'get_row_count'):
         n = store.get_row_count()
         if n >= 0:
@@ -129,6 +138,8 @@ def consume(
 
     last_compact = time.time()
     _consume_batch = min(5000, max_batch)
+    _consecutive_errors = 0
+    _last_error_report = 0.0
 
     try:
         while not shutdown.is_set():
@@ -144,6 +155,7 @@ def consume(
                 continue
 
             latest_ts = 0
+            batch_errors = 0
             for msg in msgs:
                 if msg.error():
                     m.inc_failed(msg.topic() or 'unknown')
@@ -154,6 +166,7 @@ def consume(
                     if value:
                         parse_message(value)
                         m.inc_consumed(msg.topic())
+                        _consecutive_errors = 0
                         # Track latest Kafka message timestamp
                         ts_type, ts_ms = msg.timestamp()
                         if ts_ms and ts_ms > latest_ts:
@@ -162,7 +175,17 @@ def consume(
                     logger.exception("message_processing_error",
                                      topic=msg.topic())
                     m.inc_failed(msg.topic())
+                    batch_errors += 1
+                    _consecutive_errors += 1
                     continue
+
+            if batch_errors > 0:
+                now = time.monotonic()
+                if now - _last_error_report > 60:
+                    logger.warning("message_errors_in_batch",
+                                   batch_errors=batch_errors,
+                                   consecutive_errors=_consecutive_errors)
+                    _last_error_report = now
 
             if latest_ts > 0:
                 m.set_latest_event_ts(latest_ts / 1000.0)

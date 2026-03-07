@@ -20,8 +20,44 @@ import pyarrow.flight as flight
 import structlog
 from google.protobuf import any_pb2
 from flightsql import flightsql_pb2 as pb2
+from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 logger = structlog.get_logger()
+
+# ── Prometheus metrics ───────────────────────────────────────────────
+
+FLIGHT_QUERIES = Counter(
+    'flight_sql_queries_total',
+    'Total Flight SQL queries executed',
+    ['status'],  # 'ok', 'error', 'cache_hit'
+)
+
+FLIGHT_QUERY_DURATION = Histogram(
+    'flight_sql_query_duration_seconds',
+    'Query execution time',
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30),
+)
+
+FLIGHT_ACTIVE_QUERIES = Gauge(
+    'flight_sql_active_queries',
+    'Queries currently executing',
+)
+
+FLIGHT_RESULT_ROWS = Histogram(
+    'flight_sql_result_rows',
+    'Rows returned per query',
+    buckets=(0, 10, 100, 1000, 10000, 100000, 1000000),
+)
+
+FLIGHT_POOL_REBUILDS = Counter(
+    'flight_sql_pool_rebuilds_total',
+    'Connection pool rebuild events',
+)
+
+FLIGHT_CACHE_SIZE = Gauge(
+    'flight_sql_cache_size',
+    'Queries in result cache',
+)
 
 # Stash entry TTL in seconds.
 _STASH_TTL = 60
@@ -365,9 +401,11 @@ class FlightSQLServer(_FlightSQLBase):
                         except Exception:
                             pass
                 self._record_mtimes()
+                FLIGHT_POOL_REBUILDS.inc()
                 # Clear query cache — data has changed
                 with self._query_cache_lock:
                     self._query_cache.clear()
+                    FLIGHT_CACHE_SIZE.set(0)
                 logger.info("pool_refreshed",
                             pool_size=self._pool_size,
                             snapshots=len(self._snapshot_paths))
@@ -395,17 +433,30 @@ class FlightSQLServer(_FlightSQLBase):
                 if now - ts < self._query_cache_ttl:
                     logger.info("cache_hit", sql=sql[:200],
                                 age_s=round(now - ts, 1))
+                    FLIGHT_QUERIES.labels(status='cache_hit').inc()
                     return self._stash_and_info(table)
                 # Expired — remove
                 del self._query_cache[sql]
 
         logger.info("execute_query", sql=sql[:200])
 
-        def run(conn):
-            result = conn.execute(sql)
-            return result.fetch_arrow_table()
+        FLIGHT_ACTIVE_QUERIES.inc()
+        t0 = time.monotonic()
+        try:
+            def run(conn):
+                result = conn.execute(sql)
+                return result.fetch_arrow_table()
 
-        table = self._execute_on_pool(run)
+            table = self._execute_on_pool(run)
+            FLIGHT_QUERIES.labels(status='ok').inc()
+            FLIGHT_QUERY_DURATION.observe(time.monotonic() - t0)
+            FLIGHT_RESULT_ROWS.observe(table.num_rows)
+        except Exception:
+            FLIGHT_QUERIES.labels(status='error').inc()
+            FLIGHT_QUERY_DURATION.observe(time.monotonic() - t0)
+            raise
+        finally:
+            FLIGHT_ACTIVE_QUERIES.dec()
 
         # Cache the result
         with self._query_cache_lock:
@@ -415,6 +466,7 @@ class FlightSQLServer(_FlightSQLBase):
                        if now - ts >= self._query_cache_ttl]
             for k in expired:
                 del self._query_cache[k]
+            FLIGHT_CACHE_SIZE.set(len(self._query_cache))
 
         return self._stash_and_info(table)
 

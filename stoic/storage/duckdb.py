@@ -153,10 +153,11 @@ class Store:
                 delay = min(BASE_DELAY * (2 ** (attempt - 1)), MAX_DELAY)
                 jitter = delay * JITTER * (2 * random.random() - 1)
                 sleep = delay + jitter
-                logger.debug("write_contention",
-                             op=description,
-                             attempt=attempt, max_retries=MAX_RETRIES,
-                             retry_delay=round(sleep, 3))
+                log = logger.warning if attempt >= 10 else logger.debug
+                log("write_contention",
+                    op=description,
+                    attempt=attempt, max_retries=MAX_RETRIES,
+                    retry_delay=round(sleep, 3))
                 time.sleep(sleep)
 
     def insert_arrow(
