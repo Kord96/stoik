@@ -6,12 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "stoic"
 version = "0.1.0"
 requires-python = ">=3.10"
-dependencies = ["duckdb", "pyarrow", "structlog"]
+dependencies = ["duckdb", "pyarrow", "structlog", "confluent-kafka"]
 
 [project.optional-dependencies]
-kafka = ["confluent-kafka"]
 flight = ["flightsql-dbapi", "protobuf"]
-all = ["confluent-kafka", "flightsql-dbapi", "protobuf"]
 
 [tool.setuptools.packages.find]
 include = ["stoic*"]

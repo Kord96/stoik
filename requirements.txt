@@ -1,6 +1,0 @@
-confluent-kafka>=2.0
-duckdb>=1.0
-flightsql-dbapi>=0.2
-protobuf>=4.0
-pyarrow>=14.0
-structlog>=23.0
