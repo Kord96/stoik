@@ -3,13 +3,18 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "stoic"
+name = "stoic-pipeline"
 version = "0.1.0"
+description = "Stream-to-store pipeline framework: Kafka → buffer → batch flush → DuckDB"
 requires-python = ">=3.10"
+license = {text = "MIT"}
 dependencies = ["duckdb", "pyarrow", "structlog", "confluent-kafka"]
 
 [project.optional-dependencies]
 flight = ["flightsql-dbapi", "protobuf"]
+
+[project.urls]
+Repository = "https://github.com/Kord96/stoic"
 
 [tool.setuptools.packages.find]
 include = ["stoic*"]

@@ -21,7 +21,18 @@ Data flow framework: Kafka → buffer → batch flush → DuckDB.
                                               └────────────┘
 ```
 
-Each consumer is a single instance of this pipeline, one per DuckDB file (single-writer constraint). graphdb runs 27 of these in parallel.
+Each consumer is a single instance of this pipeline, one per DuckDB file (single-writer constraint).
+
+## Installation
+
+```bash
+pip install stoic-pipeline
+```
+
+With FlightSQL support:
+```bash
+pip install stoic-pipeline[flight]
+```
 
 ## Core Abstractions (Protocol-based)
 
@@ -30,6 +41,34 @@ Each consumer is a single instance of this pipeline, one per DuckDB file (single
 - `consume()` — Generic loop: poll → parse → buffer → flush. Handles signals, heartbeat-during-flush, compaction
 - `MetricsHook` — Injectable Prometheus metrics
 - `Server` — REST API + FlightSQL query interface over DuckDB snapshots
+
+## Quick Start
+
+```python
+from stoic import Buffer, Store, consume
+
+class MyBuffer(Buffer):
+    def add(self, record):
+        self._batch.append(record)
+
+    def drain(self):
+        batch = self._batch
+        self._batch = []
+        return batch
+
+def on_flush(store, records):
+    table = pa.Table.from_pylist(records)
+    store.reconnect()
+    store.insert_arrow(table)
+    store.release()
+
+consume(
+    topic="my-topic",
+    buffer=MyBuffer(max_size=1000, max_seconds=30),
+    store=Store("/data/my.duckdb"),
+    on_flush=on_flush,
+)
+```
 
 ## Flush Cycle
 
@@ -54,12 +93,12 @@ consume() loop:
 - Don't write per-message — buffer and batch via PyArrow tables
 - Don't skip staging tables for large merges — use `insert_arrow(staging=True)` + `merge_staging()`
 
-## Installation
+## Development
 
-```bash
-pip install -e frameworks/stoic
-```
+Branches follow a promotion chain: `dev` → `test` → `main` (prod).
 
-## Used by
+Merging to `main` auto-publishes to PyPI.
 
-- **graphdb** (office/prod) — 27 consumers, each a stoic consume loop writing to DuckDB
+## License
+
+MIT
