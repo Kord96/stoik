@@ -1,6 +1,6 @@
 name: stoic
-install: pip install stoic-pipeline
-pypi: stoic-pipeline
+install: pip install stoik
+pypi: stoik
 
 purpose: |
   Stream-to-store pipeline framework.
