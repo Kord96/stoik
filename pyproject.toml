@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stoik"
-version = "0.1.0"
+version = "0.1.1"
 description = "Stream-to-store pipeline framework: Kafka → buffer → batch flush → DuckDB"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -12,6 +12,7 @@ dependencies = ["duckdb", "pyarrow", "structlog", "confluent-kafka"]
 
 [project.optional-dependencies]
 flight = ["flightsql-dbapi", "protobuf"]
+all = ["stoik[flight]"]
 
 [project.urls]
 Repository = "https://github.com/Kord96/stoik"
