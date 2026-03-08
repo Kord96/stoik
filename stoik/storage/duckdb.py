@@ -101,7 +101,7 @@ class Store:
             self.conn.close()
             self.conn = None
         if self._snapshot:
-            from stoic.storage.snapshot import refresh_snapshot
+            from stoik.storage.snapshot import refresh_snapshot
             refresh_snapshot(self.db_path)
 
     def reconnect(self) -> None:
@@ -444,7 +444,7 @@ class Store:
             self.conn = None
             logger.info("store_closed", db_path=self.db_path)
         if self._snapshot:
-            from stoic.storage.snapshot import refresh_snapshot
+            from stoik.storage.snapshot import refresh_snapshot
             refresh_snapshot(self.db_path)
 
 

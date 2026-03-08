@@ -14,7 +14,7 @@ class Message(Protocol):
 class Stream(Protocol):
     """Consumer contract for message sources.
 
-    Concrete implementations: KafkaStream (stoic.stream.kafka).
+    Concrete implementations: KafkaStream (stoik.stream.kafka).
     Deserialization is pushed into the stream plug — poll() returns
     pre-deserialized Message objects.
     """

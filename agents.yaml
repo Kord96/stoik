@@ -1,4 +1,4 @@
-name: stoic
+name: stoik
 install: pip install stoik
 pypi: stoik
 
@@ -21,13 +21,13 @@ design:
     - StoicServer: "FastAPI + FlightSQL server for serving stored data"
 
 monitoring:
-  metrics_prefix: stoic_
+  metrics_prefix: stoik_
   key_metrics:
-    - stoic_messages_consumed_total
-    - stoic_messages_produced_total
-    - stoic_buffer_flush_total
-    - stoic_buffer_flush_duration_seconds
-    - stoic_errors_total
+    - stoik_messages_consumed_total
+    - stoik_messages_produced_total
+    - stoik_buffer_flush_total
+    - stoik_buffer_flush_duration_seconds
+    - stoik_errors_total
 
 testing:
   config_file: config.py

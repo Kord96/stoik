@@ -7,7 +7,7 @@ from typing import Callable, Protocol, runtime_checkable
 class Storage(Protocol):
     """Lifecycle contract for persistence backends.
 
-    Concrete implementations: DuckDBStore (stoic.storage.duckdb).
+    Concrete implementations: DuckDBStore (stoik.storage.duckdb).
     """
 
     db_path: str

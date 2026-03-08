@@ -26,12 +26,12 @@ Each consumer is a single instance of this pipeline, one per DuckDB file (single
 ## Installation
 
 ```bash
-pip install stoic-pipeline
+pip install stoik-pipeline
 ```
 
 With FlightSQL support:
 ```bash
-pip install stoic-pipeline[flight]
+pip install stoik-pipeline[flight]
 ```
 
 ## Core Abstractions (Protocol-based)
@@ -45,7 +45,7 @@ pip install stoic-pipeline[flight]
 ## Quick Start
 
 ```python
-from stoic import Buffer, Store, consume
+from stoik import Buffer, Store, consume
 
 class MyBuffer(Buffer):
     def add(self, record):

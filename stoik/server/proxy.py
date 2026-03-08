@@ -8,7 +8,7 @@ concurrently.
 
 Usage::
 
-    python -m stoic.server.proxy \\
+    python -m stoik.server.proxy \\
         --upstream grpc://localhost:8815 \\
         --listen   grpc://0.0.0.0:8816 \\
         --pool-size 4
@@ -24,7 +24,7 @@ import structlog
 from google.protobuf import any_pb2
 from flightsql import flightsql_pb2 as pb2
 
-from stoic.server.flight import _FlightSQLBase
+from stoik.server.flight import _FlightSQLBase
 
 logger = structlog.get_logger()
 

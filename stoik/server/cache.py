@@ -13,7 +13,7 @@ warm cycle.
 
 Usage::
 
-    from stoic.server.cache import EntityCache
+    from stoik.server.cache import EntityCache
 
     tiers = {
         'domain': {'warm': True, 'warm_limit': 8000, 'lru_limit': 15000},

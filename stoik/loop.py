@@ -12,8 +12,8 @@ from typing import Callable, Optional
 
 import structlog
 
-from stoic.buffer import Buffer
-from stoic.metrics import MetricsHook, NoopMetrics
+from stoik.buffer import Buffer
+from stoik.metrics import MetricsHook, NoopMetrics
 
 logger = structlog.get_logger()
 

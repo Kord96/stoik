@@ -5,7 +5,7 @@ background warm thread, Prometheus metrics, and dependency injection for routers
 
 Usage::
 
-    from stoic.server.api import create_api, ApiConfig
+    from stoik.server.api import create_api, ApiConfig
 
     config = ApiConfig(
         flight_url='grpc://localhost:8815',
