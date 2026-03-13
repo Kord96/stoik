@@ -1,4 +1,4 @@
-# Stoic — Stream-to-Store Pipeline Framework
+# Stoik — Stream-to-Store Pipeline Framework
 
 Data flow framework: Kafka → buffer → batch flush → DuckDB.
 
