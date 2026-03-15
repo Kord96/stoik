@@ -35,7 +35,11 @@ MINIO_USE_SSL = os.environ.get('MINIO_USE_SSL', 'false').lower() == 'true'
 
 def configure_s3(conn: duckdb.DuckDBPyConnection) -> None:
     """Configure a DuckDB connection to read/write from MinIO."""
-    conn.execute("INSTALL httpfs; LOAD httpfs;")
+    try:
+        conn.execute("INSTALL httpfs;")
+    except Exception:
+        pass  # Already installed
+    conn.execute("LOAD httpfs;")
     conn.execute(f"SET s3_endpoint='{MINIO_ENDPOINT}';")
     conn.execute(f"SET s3_access_key_id='{MINIO_ACCESS_KEY}';")
     conn.execute(f"SET s3_secret_access_key='{MINIO_SECRET_KEY}';")
